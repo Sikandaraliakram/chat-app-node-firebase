@@ -23,10 +23,29 @@ db.collection("chats").doc("messages").set({
 app.use(express.json());
 
 app.post("/messages", async (req, res) => {
+  console.log(req.body);
   try {
-    const { senderId, receiverId, message, timestamp } = req.body;
+    const {
+      senderId,
+      senderName,
+      senderProfilePic,
+      receiverId,
+      receiverName,
+      receiverProfilePic,
+      message,
+      timestamp,
+    } = req.body;
 
-    if (!senderId || !receiverId || !message || !timestamp) {
+    if (
+      !senderId ||
+      !senderName ||
+      !senderProfilePic ||
+      !receiverId ||
+      !receiverName ||
+      !receiverProfilePic ||
+      !message ||
+      !timestamp
+    ) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
@@ -39,7 +58,18 @@ app.post("/messages", async (req, res) => {
 
       if (!chatRoomDoc.exists) {
         transaction.set(chatRoomRef, {
-          participants: [senderId, receiverId],
+          participants: [
+            {
+              senderId: senderId,
+              senderName: senderName,
+              senderProfilePic: senderProfilePic,
+            },
+            {
+              receiverId: receiverId,
+              receiverName: receiverName,
+              receiverProfilePic: receiverProfilePic,
+            },
+          ],
           lastMessage: message,
           lastMessageTimestamp: timestamp,
         });
@@ -51,14 +81,16 @@ app.post("/messages", async (req, res) => {
       }
 
       transaction.set(newMessageRef, {
-        senderId,
+        senderId: senderId,
+        senderName: senderName,
+        senderProfilePic: senderProfilePic,
         message,
         timestamp,
         seen: false,
       });
 
       // Update user's chat list
-      const updateUserChatList = (userId, otherUserId) => {
+      const updateUserChatList = (userId) => {
         const userChatListRef = db
           .collection("users")
           .doc(userId)
@@ -68,7 +100,18 @@ app.post("/messages", async (req, res) => {
           userChatListRef,
           {
             chatId,
-            otherUserId,
+            participants: [
+              {
+                senderId: senderId,
+                senderName: senderName,
+                senderProfilePic: senderProfilePic,
+              },
+              {
+                receiverId: receiverId,
+                receiverName: receiverName,
+                receiverProfilePic: receiverProfilePic,
+              },
+            ],
             lastMessage: message,
             lastMessageTimestamp: timestamp,
           },
