@@ -2,8 +2,18 @@ const express = require("express");
 const admin = require("firebase-admin");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore } = require("firebase-admin/firestore");
+const http = require("http");
+const socketIo = require("socket.io");
 
 const app = express();
+const server = http.createServer(app);
+// Enable CORS for all origins
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+});
 const port = process.env.PORT || 3000;
 
 // Initialize Firebase
@@ -21,6 +31,25 @@ db.collection("chats").doc("messages").set({
 
 // Middleware
 app.use(express.json());
+
+// Socket.IO connection handling
+io.on("connection", (socket) => {
+  console.log("New client connected");
+
+  socket.on("join chat", (chatId) => {
+    socket.join(chatId);
+    console.log(`User joined chat: ${chatId}`);
+  });
+
+  socket.on("leave chat", (chatId) => {
+    socket.leave(chatId);
+    console.log(`User left chat: ${chatId}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Client disconnected");
+  });
+});
 
 app.post("/messages", async (req, res) => {
   console.log(req.body);
@@ -123,6 +152,20 @@ app.post("/messages", async (req, res) => {
       updateUserChatList(receiverId, senderId);
     });
 
+    // After successfully saving the message
+    io.to(chatId).emit("new message", {
+      chatId,
+      message: {
+        id: newMessageRef.id,
+        senderId,
+        senderName,
+        senderProfilePic,
+        message,
+        timestamp,
+        seen: false,
+      },
+    });
+
     res.status(200).json({
       status: "success",
       message: "Message sent successfully",
@@ -134,11 +177,15 @@ app.post("/messages", async (req, res) => {
   }
 });
 
-// Endpoint to retrieve all messages of a chat
+// Modify the existing GET messages endpoint to filter out deleted messages
 app.get("/messages/:chatId", async (req, res) => {
   try {
     const { chatId } = req.params;
-    const { lastMessageTimestamp } = req.query;
+    const { lastMessageTimestamp, userId } = req.query;
+    console.log(chatId);
+    if (!userId) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
 
     const messagesRef = db
       .collection("chatRooms")
@@ -156,10 +203,12 @@ app.get("/messages/:chatId", async (req, res) => {
       return res.status(200).json({ messages: [] });
     }
 
-    const messages = snapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
+    const messages = snapshot.docs
+      .map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }))
+      .filter((message) => !message.deletedFor || !message.deletedFor[userId]);
 
     res.status(200).json({ messages });
   } catch (error) {
@@ -195,6 +244,13 @@ app.post("/messages/:chatId/seen", async (req, res) => {
     });
 
     await batch.commit();
+
+    // After successfully marking messages as seen
+    io.to(chatId).emit("messages seen", {
+      chatId,
+      userId,
+      lastSeenTimestamp,
+    });
 
     res
       .status(200)
@@ -234,6 +290,115 @@ app.get("/chats/:userId", async (req, res) => {
   }
 });
 
-app.listen(port, () => {
+// Endpoint to delete a message
+app.delete("/messages/:chatId/:messageId", async (req, res) => {
+  try {
+    const { chatId, messageId } = req.params;
+    const { userId, deleteForEveryone } = req.body;
+    console.log(req.params, req.body);
+    if (!userId) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const messageRef = db
+      .collection("chatRooms")
+      .doc(chatId)
+      .collection("messages")
+      .doc(messageId);
+
+    const messageDoc = await messageRef.get();
+
+    if (!messageDoc.exists) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const messageData = messageDoc.data();
+    console.log(messageData);
+    if (deleteForEveryone && +messageData.senderId !== +userId) {
+      return res
+        .status(403)
+        .json({ error: "Unauthorized to delete this message for everyone" });
+    }
+
+    if (deleteForEveryone) {
+      // Delete the message for everyone
+      await messageRef.delete();
+    } else {
+      // Delete the message only for the current user
+      await messageRef.update({
+        [`deletedFor.${userId}`]: true,
+      });
+    }
+
+    // After successfully deleting the message
+    io.to(chatId).emit("message deleted", {
+      chatId,
+      messageId,
+      deleteForEveryone,
+    });
+
+    res
+      .status(200)
+      .json({ status: "success", message: "Message deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting message:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Endpoint to delete a chat
+app.delete("/chats/:chatId", async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const userChatRef = db
+      .collection("users")
+      .doc(userId)
+      .collection("chatList")
+      .doc(chatId);
+
+    const userChatDoc = await userChatRef.get();
+
+    if (!userChatDoc.exists) {
+      return res.status(404).json({ error: "Chat not found for this user" });
+    }
+
+    // Delete chat only for the current user
+    await userChatRef.delete();
+
+    // After successfully deleting the chat
+    io.to(chatId).emit("chat deleted", {
+      chatId,
+      deleteForEveryone,
+    });
+
+    res
+      .status(200)
+      .json({ status: "success", message: "Chat deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting chat:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Helper function to delete a collection
+async function deleteCollection(db, collectionPath) {
+  const collectionRef = db.collection(collectionPath);
+  const batch = db.batch();
+
+  const snapshot = await collectionRef.get();
+  snapshot.docs.forEach((doc) => {
+    batch.delete(doc.ref);
+  });
+
+  await batch.commit();
+}
+
+server.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
